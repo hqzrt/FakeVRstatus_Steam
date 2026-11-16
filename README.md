@@ -9,6 +9,8 @@
 - Windows 10/11
 - Steam
 - SteamVR (бесплатный, есть в библиотеке стима)
+<img width="213" height="61" alt="image" src="https://github.com/user-attachments/assets/ecb851b4-009b-417e-8d1f-852bd886554c" />
+
 
 ## Установка
 
