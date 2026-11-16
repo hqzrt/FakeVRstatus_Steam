@@ -4,12 +4,15 @@
 
 Ставит в SteamVR виртуальный шлем и держит SteamVR в фоне со скрытыми окнами.
 
+<img width="213" height="61" alt="image" src="https://github.com/user-attachments/assets/f0c5fb8b-31bc-472d-9dfd-bd4da3ff3a2a" />
+
+
 ## Что нужно
 
 - Windows 10/11
 - Steam
 - SteamVR (бесплатный, есть в библиотеке стима)
-<img width="213" height="61" alt="image" src="https://github.com/user-attachments/assets/ecb851b4-009b-417e-8d1f-852bd886554c" />
+
 
 
 ## Установка
