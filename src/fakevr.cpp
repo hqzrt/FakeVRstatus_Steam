@@ -21,7 +21,8 @@ static const char *kManifest =
     "{\n  \"alwaysActivate\": false,\n  \"name\": \"fakehmd\",\n  \"directory\": \"\",\n"
     "  \"resourceOnly\": false,\n  \"hmd_presence\": [ \"*.*\" ]\n}\n";
 
-static const wchar_t *kHide[] = { L"vrmonitor.exe", L"vrcompositor.exe" };
+static const wchar_t *kHide[] = { L"vrmonitor.exe", L"vrcompositor.exe", L"vrwebhelper.exe",
+                                  L"vrdashboard.exe", L"vrstartup.exe", L"vrserver.exe" };
 static const wchar_t *kAll[]  = { L"vrserver.exe", L"vrmonitor.exe", L"vrcompositor.exe",
                                   L"vrdashboard.exe", L"vrwebhelper.exe", L"vrstartup.exe" };
 
@@ -78,6 +79,30 @@ static void StopVR()
         if (h) { TerminateProcess(h, 0); CloseHandle(h); }
     }
 }
+static bool IsElevated(DWORD pid)
+{
+    HANDLE p = pid ? OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) : GetCurrentProcess();
+    if (!p) return pid != 0 && GetLastError() == ERROR_ACCESS_DENIED;
+    bool r = false; HANDLE tok;
+    if (OpenProcessToken(p, TOKEN_QUERY, &tok)) {
+        TOKEN_ELEVATION e; DWORD sz;
+        if (GetTokenInformation(tok, TokenElevation, &e, sizeof e, &sz)) r = e.TokenIsElevated != 0;
+        CloseHandle(tok);
+    }
+    if (pid) CloseHandle(p);
+    return r;
+}
+static DWORD WINAPI AdminWarnThread(LPVOID)
+{
+    MessageBoxW(nullptr,
+        L"SteamVR запущен от имени администратора, поэтому FakeVR не может спрятать его окна.\n\n"
+        L"Скорее всего, Steam запускается от админа. Закрой Steam (Steam → Exit), "
+        L"у steam.exe в Свойства → Совместимость сними галочку «Запускать от имени администратора» "
+        L"и запусти Steam заново.\n\nСтатус VR при этом работает, просто окна будут видны.",
+        L"FakeVR", MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
+    return 0;
+}
+
 static BOOL CALLBACK HideProc(HWND h, LPARAM l)
 {
     auto *pids = reinterpret_cast<std::vector<DWORD> *>(l);
@@ -121,12 +146,29 @@ static fs::path SteamVRDir(const fs::path &steam)
 static void Backup(const fs::path &f)
 { fs::path b = f; b += L".bak"; if (!Exists(b)) CopyFileW(f.c_str(), b.c_str(), TRUE); }
 
+static string Sub(const string &t, const string &pattern, const string &value)
+{
+    std::regex re(pattern);
+    string out; size_t last = 0;
+    for (auto it = std::sregex_iterator(t.begin(), t.end(), re); it != std::sregex_iterator(); ++it) {
+        out.append(t, last, (size_t)it->position() - last);
+        out += (*it)[1].str();
+        out += value;
+        last = (size_t)it->position() + (size_t)it->length();
+    }
+    out.append(t, last, string::npos);
+    return out;
+}
+
+static const char *kBrokenLine = "(\\n[ \\t]*)99999,(?=[ \\t]*\\r?\\n)";
+
 static bool PatchKeys(const fs::path &f, const std::vector<std::pair<string, string>> &kv)
 {
     string t; if (!ReadAll(f, t)) return false;
     string orig = t;
+    t = Sub(t, kBrokenLine, "\"turnOffScreensTimeout\": 999999,");
     for (auto &p : kv)
-        t = std::regex_replace(t, std::regex("(\"" + p.first + "\"\\s*:\\s*)[^,\\r\\n}]+"), "$1" + p.second);
+        t = Sub(t, "(\"" + p.first + "\"\\s*:\\s*)[^,\\r\\n}]+", p.second);
     if (t == orig) return true;
     Backup(f); return WriteAll(f, t.data(), t.size());
 }
@@ -134,10 +176,9 @@ static bool PatchUser(const fs::path &f, const string &forced, bool nullEnable)
 {
     string t; if (!ReadAll(f, t)) return true;
     string orig = t;
-    t = std::regex_replace(t, std::regex("(\"forcedDriver\"\\s*:\\s*)\"[^\"]*\""), "$1\"" + forced + "\"");
-    t = std::regex_replace(t, std::regex("(\"requireHmd\"\\s*:\\s*)(true|false)"), "$1true");
-    t = std::regex_replace(t, std::regex("(\"driver_null\"\\s*:\\s*\\{[^}]*?\"enable\"\\s*:\\s*)(true|false)"),
-                           string("$1") + (nullEnable ? "true" : "false"));
+    t = Sub(t, "(\"forcedDriver\"\\s*:\\s*)\"[^\"]*\"", "\"" + forced + "\"");
+    t = Sub(t, "(\"requireHmd\"\\s*:\\s*)(?:true|false)", "true");
+    t = Sub(t, "(\"driver_null\"\\s*:\\s*\\{[^}]*?\"enable\"\\s*:\\s*)(?:true|false)", nullEnable ? "true" : "false");
     if (t == orig) return true;
     Backup(f); return WriteAll(f, t.data(), t.size());
 }
@@ -173,7 +214,8 @@ static bool DriverLooksInstalled()
     if (!Exists(vr / L"drivers" / L"fakehmd" / L"bin" / L"win64" / L"driver_fakehmd.dll")) return false;
     string t;
     if (ReadAll(vr / L"resources" / L"settings" / L"default.vrsettings", t) &&
-        !std::regex_search(t, std::regex("\"forcedDriver\"\\s*:\\s*\"fakehmd\""))) return false;
+        (!std::regex_search(t, std::regex("\"forcedDriver\"\\s*:\\s*\"fakehmd\"")) ||
+         std::regex_search(t, std::regex(kBrokenLine)))) return false;
     if (ReadAll(steam / L"config" / L"steamvr.vrsettings", t) &&
         std::regex_search(t, std::regex("\"forcedDriver\"\\s*:\\s*\"(?!fakehmd\")[^\"]+\""))) return false;
     return true;
@@ -204,29 +246,49 @@ static void SetAutostart(bool on)
 static const wchar_t *kLnkOn = L"VR статус ВКЛ.lnk";
 static const wchar_t *kLnkOff = L"VR статус ВЫКЛ.lnk";
 
+static const wchar_t *kStopEvent = L"FakeVR_Stop_Event";
+
 static void RunLauncher(bool autostart)
 {
     HANDLE mtx = CreateMutexW(nullptr, TRUE, L"FakeVR_Launcher_Mutex");
-    if (GetLastError() == ERROR_ALREADY_EXISTS) return;
-    if (autostart) Sleep(20000);
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        if (!autostart) ShellExecuteW(nullptr, L"open", L"steam://run/250820", nullptr, nullptr, SW_SHOWNORMAL);
+        return;
+    }
+    HANDLE stopEv = CreateEventW(nullptr, TRUE, FALSE, kStopEvent);
+    if (stopEv) ResetEvent(stopEv);
+    if (autostart && stopEv && WaitForSingleObject(stopEv, 20000) == WAIT_OBJECT_0) return;
 
     if (!VrRunning() && !DriverLooksInstalled()) InstallDriver();
 
     ShellExecuteW(nullptr, L"open", L"steam://run/250820", nullptr, nullptr, SW_SHOWNORMAL);
-    bool started = false; DWORD t0 = GetTickCount(), lastSq = 0;
+    bool started = false, warned = false; DWORD t0 = GetTickCount(), lastSq = 0, lastScan = 0;
+    std::vector<DWORD> pids;
     for (;;) {
-        std::vector<DWORD> pids = FindPids(kHide, 2);
+        DWORD now = GetTickCount();
+        if (pids.empty() || now - lastScan > 1500) { pids = FindPids(kHide, 6); lastScan = now; }
         if (!pids.empty()) {
-            if (!started) { started = true; t0 = GetTickCount(); }
+            if (!started) {
+                started = true; t0 = now; lastSq = now;
+                if (!warned && !IsElevated(0))
+                    for (DWORD p : pids)
+                        if (IsElevated(p)) {
+                            warned = true;
+                            HANDLE th = CreateThread(nullptr, 0, AdminWarnThread, nullptr, 0, nullptr);
+                            if (th) CloseHandle(th);
+                            break;
+                        }
+            }
             EnumWindows(HideProc, reinterpret_cast<LPARAM>(&pids));
-        } else if (started) {
-            if (FindPids(kAll, 1).empty()) break;
-        } else if (GetTickCount() - t0 > 300000) break;
-
-        DWORD age = GetTickCount() - t0;
-        if (started && age > 20000 && GetTickCount() - lastSq > 60000) { Squeeze(); lastSq = GetTickCount(); }
-        Sleep(age < 90000 ? 500 : 3000);
+        } else {
+            started = false;
+        }
+        if (started && now - t0 > 20000 && now - lastSq > 60000) { Squeeze(); lastSq = now; }
+        DWORD wait = started ? 200 : 500;
+        if (stopEv) { if (WaitForSingleObject(stopEv, wait) == WAIT_OBJECT_0) break; }
+        else Sleep(wait);
     }
+    if (stopEv) CloseHandle(stopEv);
     if (mtx) CloseHandle(mtx);
 }
 
@@ -302,7 +364,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmd, int)
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     wstring args = cmd ? cmd : L"";
 
-    if (args.find(L"--stop") != wstring::npos) { StopVR(); return 0; }
+    if (args.find(L"--stop") != wstring::npos) {
+        HANDLE ev = OpenEventW(EVENT_MODIFY_STATE, FALSE, kStopEvent);
+        if (ev) { SetEvent(ev); CloseHandle(ev); }
+        StopVR(); return 0;
+    }
     if (args.find(L"--uninstall") != wstring::npos) { Uninstall(); return 0; }
     if (args.find(L"--autostart") != wstring::npos) { RunLauncher(true); return 0; }
 
